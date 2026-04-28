@@ -1,0 +1,24 @@
+services:
+  angl-recognition:
+    container_name: angl-recognition
+    build: "."
+    restart: "always"
+
+    volumes:
+      - angl-recognition-database:/usr/src/app/data
+
+    networks:
+      - proxy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  angl-recognition-database:
+
+networks:
+  proxy:
+    name: vpn-proxy-network
+    external: true
