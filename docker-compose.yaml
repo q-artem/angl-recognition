@@ -5,7 +5,7 @@ services:
     restart: "always"
 
     volumes:
-      - angl-recognition-database:/usr/src/app/data
+      - ./data:/usr/src/app/data
 
     networks:
       - proxy
@@ -14,9 +14,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  angl-recognition-database:
 
 networks:
   proxy:
