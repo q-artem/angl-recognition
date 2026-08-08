@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import logging
 import os
+import time
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
@@ -19,9 +20,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 YANDEX_DICT_KEY = os.getenv("YANDEX_DICT_KEY")
 assert BOT_TOKEN is not None and YANDEX_DICT_KEY is not None, "BOT_TOKEN and YANDEX_DICT_KEY must be set"
 
-PROXY_URL = "http://xray1:xray1@vpn-proxy:1080"
+PROXY_URL = "http://xray:xray@vpn-proxy:1080"
 
-engine = create_async_engine("sqlite+aiosqlite:///words.db")
+engine = create_async_engine("sqlite+aiosqlite:///data/words.db")
 async_session = async_sessionmaker(engine, expire_on_commit=False)
 Base = declarative_base()
 
@@ -76,51 +77,97 @@ async def cmd_start(message: Message):
     )
     await message.answer(text)
 
+SOURCE_TIMEOUT = 6 
+
+
+async def _from_google(word: str) -> list[str]:
+    translated_text = await asyncio.to_thread(
+        GoogleTranslator(
+            source='en',
+            target='ru',
+            proxies={'http': PROXY_URL, 'https': PROXY_URL}
+        ).translate,
+        word
+    )
+    return [t.strip().lower() for t in (translated_text or "").split(',') if t.strip()]
+
+
+async def _from_yandex(word: str) -> list[str]:
+    url = "https://dictionary.yandex.net/api/v1/dicservice.json/lookup"
+    params = {
+        "key": YANDEX_DICT_KEY or "",
+        "lang": "en-ru",
+        "text": word
+    }
+
+    timeout = aiohttp.ClientTimeout(total=SOURCE_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as http_session:
+        async with http_session.get(url, params=params, proxy=PROXY_URL) as response:
+            response.raise_for_status()
+            data = await response.json()
+
+    found = []
+    for pos_block in data.get('def', []):
+        for tr in pos_block.get('tr', []):
+            found.append(tr['text'].lower())
+            for syn in tr.get('syn', []):
+                found.append(syn['text'].lower())
+    return found
+
+
 async def translate_word(word: str) -> list[str]:
-    try:
-        translated_text = await asyncio.to_thread(
-            GoogleTranslator(
-                source='en',
-                target='ru',
-                proxies={'http': PROXY_URL, 'https': PROXY_URL}
-            ).translate,
-            word
-        )
-        translationGoogle = list(dict.fromkeys([t.strip().lower() for t in translated_text.split(',')]))
+    async def guarded(name: str, coro) -> list[str]:
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(coro, SOURCE_TIMEOUT)
+            logging.info("%s: %d вариантов за %.1f с", name, len(result), time.monotonic() - started)
+            return result
+        except asyncio.TimeoutError:
+            logging.warning("%s: таймаут после %.1f с", name, time.monotonic() - started)
+        except Exception as e:
+            logging.warning("%s: ошибка за %.1f с — %s", name, time.monotonic() - started, e)
+        return []
 
-        url = "https://dictionary.yandex.net/api/v1/dicservice.json/lookup"
-        params = {
-            "key": YANDEX_DICT_KEY or "",
-            "lang": "en-ru",
-            "text": word
-        }
+    google, yandex = await asyncio.gather(
+        guarded("google", _from_google(word)),
+        guarded("yandex", _from_yandex(word)),
+    )
 
-        async with aiohttp.ClientSession() as http_session:
-            async with http_session.get(url, params=params, proxy=PROXY_URL) as response:
-                data = await response.json()
-
-                translationsYandex =[]
-                if 'def' in data and data['def']:
-                    for pos_block in data['def']:
-                        for tr in pos_block.get('tr',[]):
-                            translationsYandex.append(tr['text'].lower())
-                            if 'syn' in tr:
-                                for syn in tr['syn']:
-                                    translationsYandex.append(syn['text'].lower())
-
-        translations = list(dict.fromkeys(translationGoogle + translationsYandex))
-
-        return translations[:5]
-
-    except Exception as e:
-        print(f"Translation error: {e}")
-        return ["перевод_не_найден"]
+    translations = list(dict.fromkeys(google + yandex))
+    return translations[:5] or ["перевод_не_найден"]
 
 
 @dp.message(F.text)
 async def add_word(message: Message):
-    assert message.text is not None
+    assert message.text is not None and message.from_user is not None
     en_word = message.text.strip().lower()
+
+    async with async_session() as session:
+        known = (await session.execute(
+            select(Word).where(
+                Word.user_id == message.from_user.id,
+                Word.word_en == en_word
+            )
+        )).scalars().first()
+        if known is not None:
+            known_id = known.id
+            known_translations = list(known.translations_ru)
+            known_saved_at = known.saved_at
+            known_next = known.next_repeat_time
+            known_idx = known.interval_index
+
+    if known is not None:
+        await message.answer(
+            f"🇬🇧 <b>{en_word}</b>\n"
+            f"🇷🇺 <tg-spoiler>{', '.join(known_translations)}</tg-spoiler>\n\n"
+            f"Уже в словаре с {known_saved_at:%d.%m.%Y}. "
+            f"Следующее повторение {known_next:%d.%m в %H:%M}, интервал {INTERVALS_STR[known_idx]}.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=known_id).pack())
+            ]])
+        )
+        return
+
     translations = await translate_word(en_word)
 
     msg = await message.answer(
