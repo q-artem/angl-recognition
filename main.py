@@ -82,11 +82,7 @@ SOURCE_TIMEOUT = 6
 
 async def _from_google(word: str) -> list[str]:
     translated_text = await asyncio.to_thread(
-        GoogleTranslator(
-            source='en',
-            target='ru',
-            proxies={'http': PROXY_URL, 'https': PROXY_URL}
-        ).translate,
+        GoogleTranslator(source='en', target='ru').translate,
         word
     )
     return [t.strip().lower() for t in (translated_text or "").split(',') if t.strip()]
@@ -102,7 +98,7 @@ async def _from_yandex(word: str) -> list[str]:
 
     timeout = aiohttp.ClientTimeout(total=SOURCE_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as http_session:
-        async with http_session.get(url, params=params, proxy=PROXY_URL) as response:
+        async with http_session.get(url, params=params) as response:
             response.raise_for_status()
             data = await response.json()
 

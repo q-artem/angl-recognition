@@ -5,8 +5,10 @@
 Скрипт трогает только строки, у которых message_id всё ещё из экспорта:
 после первой успешной отправки бот его перезаписывает.
 
-Просроченные повторения раскладываются от текущего момента с шагом --step,
-ещё не наступившие остаются как в эталоне.
+Ещё не наступившие повторения остаются как в эталоне. Просроченные слова
+равномерно раскладываются внутри своего интервала от текущего момента, чтобы
+не прийти разом: каждое придёт не позже, чем через свой интервал. Короткие
+интервалы растягиваются до --min-window часов.
 
 Запускать при остановленном боте, внутри контейнера (чтобы время совпадало с ботом):
     docker compose run --rm angl-recognition python reset_intervals.py          # показать изменения
@@ -14,7 +16,10 @@
 """
 import argparse
 import sqlite3
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
+
+from main import INTERVALS
 
 FMT = "%Y-%m-%d %H:%M:%S.%f"
 COLUMNS = "id, user_id, message_id, word_en, saved_at, interval_index, next_repeat_time"
@@ -22,7 +27,7 @@ COLUMNS = "id, user_id, message_id, word_en, saved_at, interval_index, next_repe
 parser = argparse.ArgumentParser()
 parser.add_argument("--db", default="data/words.db")
 parser.add_argument("--reference", default="data/restored.db", help="база, собранная из экспорта чата")
-parser.add_argument("--step", type=int, default=30, help="секунд между просроченными повторениями")
+parser.add_argument("--min-window", type=int, default=24, help="минимальное окно раскладки в часах")
 parser.add_argument("--apply", action="store_true", help="записать изменения (по умолчанию только показать)")
 args = parser.parse_args()
 
@@ -34,24 +39,33 @@ reference = {
 }
 
 db = sqlite3.connect(args.db)
-todo = []
+now = datetime.now()
+keep, overdue = [], defaultdict(list)
 for id_, user_id, message_id, word_en, saved_at, idx, next_time in db.execute(f"select {COLUMNS} from words"):
     ref_row = reference.get((id_, user_id, word_en, saved_at))
     if ref_row is None or ref_row[0] != message_id:
         continue  # слово добавлено после восстановления или бот уже отправил ему повторение
-    todo.append((ref_row[2], id_, word_en, idx, ref_row[1], next_time))
+    _, ref_idx, ref_time = ref_row
+    row = (ref_time, id_, word_en, idx, ref_idx, next_time)
+    if datetime.strptime(ref_time, FMT) > now:
+        keep.append((row, datetime.strptime(ref_time, FMT)))
+    else:
+        overdue[ref_idx].append(row)
 
-now = datetime.now()
-slot = now
+planned = list(keep)
+for ref_idx, rows in overdue.items():
+    window = max(INTERVALS[ref_idx], timedelta(hours=args.min_window))
+    for k, row in enumerate(sorted(rows)):
+        planned.append((row, now + window * (k + 1) / len(rows)))
+
 updates = []
-print(f"сейчас {now:%d.%m %H:%M:%S}, к восстановлению {len(todo)} из {len(reference)} слов\n")
-for ref_time, id_, word_en, old_idx, new_idx, old_time in sorted(todo):
-    new_time = datetime.strptime(ref_time, FMT)
-    if new_time <= now:
-        slot += timedelta(seconds=args.step)
-        new_time = slot
+print(f"сейчас {now:%d.%m %H:%M:%S}, к восстановлению {len(planned)} из {len(reference)} слов\n")
+for (_, id_, word_en, old_idx, new_idx, old_time), new_time in sorted(planned, key=lambda p: p[1]):
     updates.append((new_idx, new_time.strftime(FMT), id_))
     print(f"{id_:>4} {word_en:<25} интервал {old_idx} -> {new_idx}   {old_time[:16]} -> {new_time:%Y-%m-%d %H:%M}")
+
+per_day = Counter((new_time.date() - now.date()).days for _, new_time in planned)
+print("\nповторений по дням от сегодня:", ", ".join(f"+{d}: {n}" for d, n in sorted(per_day.items())))
 
 if not updates:
     print("нечего менять")
