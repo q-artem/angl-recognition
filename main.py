@@ -1,13 +1,15 @@
 import aiohttp
 import asyncio
+import html
 import logging
 import os
+import re
 import time
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InaccessibleMessage, ReplyParameters
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InaccessibleMessage, ReplyParameters, BufferedInputFile
 from aiogram.filters.callback_data import CallbackData
 from sqlalchemy import Column, Integer, String, DateTime, JSON, BigInteger, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -19,6 +21,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YANDEX_DICT_KEY = os.getenv("YANDEX_DICT_KEY")
 assert BOT_TOKEN is not None and YANDEX_DICT_KEY is not None, "BOT_TOKEN and YANDEX_DICT_KEY must be set"
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)  # кому доступна команда bd; 0 — никому
 
 PROXY_URL = "http://xray:xray@vpn-proxy:1080"
 
@@ -77,7 +80,37 @@ async def cmd_start(message: Message):
     )
     await message.answer(text)
 
-SOURCE_TIMEOUT = 6 
+
+BD_MAX_ROWS = 1000
+
+
+# должен стоять раньше add_word, иначе запрос уйдёт в перевод
+@dp.message(F.from_user.id == ADMIN_ID, F.text.regexp(r"(?is)^bd\s+(.+)").as_("query"))
+async def bd_request(message: Message, query: re.Match):
+    sql = query.group(1).strip()
+    logging.info("bd: %s", sql)
+    try:
+        async with engine.begin() as conn:
+            # exec_driver_sql, а не text(): иначе ':что-то' внутри строк парсится как параметр
+            result = await conn.exec_driver_sql(sql)
+            if result.returns_rows:
+                rows = result.fetchmany(BD_MAX_ROWS + 1)
+                lines = ["\t".join(result.keys())] + ["\t".join(map(str, row)) for row in rows[:BD_MAX_ROWS]]
+                if len(rows) > BD_MAX_ROWS:
+                    lines.append(f"… показаны первые {BD_MAX_ROWS} строк")
+                answer = "\n".join(lines)
+            else:
+                answer = f"Готово, затронуто строк: {result.rowcount}" if result.rowcount >= 0 else "Готово"
+    except Exception as e:
+        answer = f"Ошибка: {getattr(e, 'orig', None) or e}"
+
+    if len(answer) > 4000:
+        await message.answer_document(BufferedInputFile(answer.encode(), filename="result.tsv"))
+    else:
+        await message.answer(f"<pre>{html.escape(answer)}</pre>")
+
+
+SOURCE_TIMEOUT = 6
 
 
 async def _from_google(word: str) -> list[str]:
