@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InaccessibleMessage
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InaccessibleMessage, ReplyParameters
 from aiogram.filters.callback_data import CallbackData
 from sqlalchemy import Column, Integer, String, DateTime, JSON, BigInteger, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -247,8 +247,6 @@ async def scheduler():
             words = result.scalars().all()
             for word in words:
                 next_idx = min(word.interval_index + 1, len(INTERVALS) - 1)
-                word.interval_index = next_idx
-                word.next_repeat_time = now + INTERVALS[next_idx]
 
                 text = (
                     f"<b>{word.word_en}</b>\n"
@@ -259,9 +257,20 @@ async def scheduler():
                     InlineKeyboardButton(text="Не вспомнил", callback_data=ForgotWord(id=word.id).pack())
                 ]])
                 try:
-                    await bot.send_message(chat_id=word.user_id, text=text, reply_markup=markup, reply_to_message_id=word.message_id)
-                except Exception:
-                    pass
+                    sent = await bot.send_message(
+                        chat_id=word.user_id, text=text, reply_markup=markup,
+                        reply_parameters=ReplyParameters(message_id=word.message_id, allow_sending_without_reply=True)
+                    )
+                except Exception as e:
+                    logging.warning("повторение %r (id=%d) не отправлено: %s", word.word_en, word.id, e)
+                    continue
+
+                # у восстановленных из экспорта слов message_id со стороны пользователя, бот его не видит —
+                # дальше отвечаем на только что отправленное повторение
+                if sent.reply_to_message is None:
+                    word.message_id = sent.message_id
+                word.interval_index = next_idx
+                word.next_repeat_time = now + INTERVALS[next_idx]
             if words:
                 await session.commit()
 
