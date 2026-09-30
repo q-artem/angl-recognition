@@ -4,7 +4,9 @@ import html
 import logging
 import os
 import re
+import ssl
 import time
+import uuid
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
@@ -14,7 +16,6 @@ from aiogram.filters.callback_data import CallbackData
 from sqlalchemy import Column, Integer, String, DateTime, JSON, BigInteger, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
-from deep_translator import GoogleTranslator, LingueeTranslator
 from aiogram.client.session.aiohttp import AiohttpSession
 
 load_dotenv()
@@ -22,6 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 YANDEX_DICT_KEY = os.getenv("YANDEX_DICT_KEY")
 assert BOT_TOKEN is not None and YANDEX_DICT_KEY is not None, "BOT_TOKEN and YANDEX_DICT_KEY must be set"
 ADMIN_ID = int(os.getenv("ADMIN_ID") or 0)  # кому доступна команда bd; 0 — никому
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")  # без ключа переводит только словарь Яндекса
 
 PROXY_URL = "http://xray:xray@vpn-proxy:1080"
 
@@ -113,12 +115,56 @@ async def bd_request(message: Message, query: re.Match):
 SOURCE_TIMEOUT = 6
 
 
-async def _from_google(word: str) -> list[str]:
-    translated_text = await asyncio.to_thread(
-        GoogleTranslator(source='en', target='ru').translate,
-        word
-    )
-    return [t.strip().lower() for t in (translated_text or "").split(',') if t.strip()]
+# API Сбера подписан корневым сертификатом Минцифры, которого нет в системном хранилище
+GIGACHAT_SSL = ssl.create_default_context()
+GIGACHAT_SSL.load_verify_locations("certs/russian_trusted_root_ca.pem")
+GIGACHAT_PROMPT = (
+    "Переведи английское слово или выражение на русский. Если это идиома или устойчивое выражение, "
+    "переводи по смыслу, а не дословно. Ответь только вариантами перевода через запятую, "
+    "от одного до трёх, строчными буквами, без пояснений."
+)
+_gigachat_token = {"value": "", "expires_at": 0.0}
+_gigachat_lock = asyncio.Lock()  # на бесплатном тарифе генерация идёт в один поток
+
+
+async def _from_gigachat(word: str) -> list[str]:
+    if not GIGACHAT_AUTH_KEY:
+        return []
+
+    timeout = aiohttp.ClientTimeout(total=SOURCE_TIMEOUT)
+    async with _gigachat_lock, aiohttp.ClientSession(timeout=timeout) as http_session:
+        if time.time() > _gigachat_token["expires_at"] - 60:  # токен живёт 30 минут
+            async with http_session.post(
+                "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+                headers={"Authorization": f"Basic {GIGACHAT_AUTH_KEY}", "RqUID": str(uuid.uuid4())},
+                data={"scope": "GIGACHAT_API_PERS"},
+                ssl=GIGACHAT_SSL,
+            ) as response:
+                response.raise_for_status()
+                token = await response.json()
+            _gigachat_token.update(value=token["access_token"], expires_at=token["expires_at"] / 1000)
+
+        async with http_session.post(
+            "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {_gigachat_token['value']}"},
+            json={
+                "model": "GigaChat-2",
+                "temperature": 0.1,
+                "max_tokens": 60,
+                "messages": [
+                    {"role": "system", "content": GIGACHAT_PROMPT},
+                    {"role": "user", "content": word},
+                ],
+            },
+            ssl=GIGACHAT_SSL,
+        ) as response:
+            if response.status == 401:
+                _gigachat_token["expires_at"] = 0  # токен отозвали — в следующий раз получим новый
+            response.raise_for_status()
+            data = await response.json()
+
+    answer = data["choices"][0]["message"]["content"]
+    return [t.strip(" .\"'«»").lower() for t in answer.split(",") if t.strip(" .\"'«»")]
 
 
 async def _from_yandex(word: str) -> list[str]:
@@ -157,12 +203,17 @@ async def translate_word(word: str) -> list[str]:
             logging.warning("%s: ошибка за %.1f с — %s", name, time.monotonic() - started, e)
         return []
 
-    google, yandex = await asyncio.gather(
-        guarded("google", _from_google(word)),
-        guarded("yandex", _from_yandex(word)),
-    )
+    if " " in word:
+        # фразы и идиомы словарь почти не знает — основной перевод от GigaChat
+        gigachat, yandex = await asyncio.gather(
+            guarded("gigachat", _from_gigachat(word)),
+            guarded("yandex", _from_yandex(word)),
+        )
+        translations = gigachat + yandex
+    else:
+        translations = await guarded("yandex", _from_yandex(word)) or await guarded("gigachat", _from_gigachat(word))
 
-    translations = list(dict.fromkeys(google + yandex))
+    translations = list(dict.fromkeys(translations))
     return translations[:5] or ["перевод_не_найден"]
 
 
