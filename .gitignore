@@ -11,3 +11,7 @@ wheels/
 
 # Environment variables
 .env
+# словари
+*.7z
+Большая советская энциклопедия (БСЭ)/
+data/ru-ru_teddy-*

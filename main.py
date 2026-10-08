@@ -6,8 +6,10 @@ import os
 import random
 import re
 import ssl
+import struct
 import time
 import uuid
+import zlib
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
@@ -67,6 +69,11 @@ class KeepOriginal(CallbackData, prefix="keep"):
     word: str
 
 
+class SwitchMode(CallbackData, prefix="mode"):
+    id: int  # 0 — слово ещё не в словаре (не нашлось в прежнем режиме)
+    to_dict: bool
+
+
 session = AiohttpSession(proxy=PROXY_URL)
 
 
@@ -74,7 +81,7 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'), sess
 logging.basicConfig(level=logging.INFO)
 dp = Dispatcher()
 
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command, CommandObject
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -256,12 +263,101 @@ def flags(word: str) -> tuple[str, str]:
     return ("🇷🇺", "🇬🇧") if is_russian(word) else ("🇬🇧", "🇷🇺")
 
 
+NOT_FOUND = "перевод_не_найден"
+DICT_PATH = "data/ru-ru_teddy-20151106"  # сводный толковый словарь в формате StarDict
+DICT_MARK = "__dict_definition__"  # в translations_ru вместо перевода: слово сохранено в режиме толкования
+DICT_NOT_FOUND = "нет в словаре"
+DICT_ARTICLES = 2  # сколько статей показывать в карточке и повторении
+MESSAGE_LIMIT = 4096  # лимит Bot API на текст сообщения
+dict_mode: dict[int, bool] = {}  # последний выбранный пользователем режим для русских слов
+
+
+class RuDictionary:
+    """StarDict: индекс держим в памяти, статьи читаем из .dict.dz кусками, не распаковывая файл целиком."""
+
+    def __init__(self, path: str):
+        self.articles: dict[str, list[tuple[int, int]]] = {}
+        idx = open(path + ".idx", "rb").read()
+        i = 0
+        while i < len(idx):
+            end = idx.index(b"\0", i)
+            offset, size = struct.unpack(">II", idx[end + 1:end + 9])
+            self.articles.setdefault(idx[i:end].decode(), []).append((offset, size))
+            i = end + 9
+
+        # dictzip — это gzip, у которого в поле FEXTRA лежит таблица независимо сжатых кусков
+        self.file = open(path + ".dict.dz", "rb")
+        flags = self.file.read(10)[3]
+        extra = self.file.read(struct.unpack("<H", self.file.read(2))[0])
+        self.chunk_len, chunk_count = struct.unpack("<HH", extra[6:10])
+        chunk_sizes = struct.unpack(f"<{chunk_count}H", extra[10:10 + 2 * chunk_count])
+        for flag in (8, 16):  # имя файла и комментарий, оба до нулевого байта
+            if flags & flag:
+                while self.file.read(1) != b"\0":
+                    pass
+        if flags & 2:
+            self.file.read(2)
+        self.chunks = [self.file.tell()]
+        for size in chunk_sizes:
+            self.chunks.append(self.chunks[-1] + size)
+
+    def _read(self, offset: int, size: int) -> str:
+        first, last = offset // self.chunk_len, (offset + size - 1) // self.chunk_len
+        data = b""
+        for chunk in range(first, last + 1):
+            self.file.seek(self.chunks[chunk])
+            data += zlib.decompressobj(-15).decompress(self.file.read(self.chunks[chunk + 1] - self.chunks[chunk]))
+        start = offset - first * self.chunk_len
+        return data[start:start + size].decode("utf-8", "replace")
+
+    def lookup(self, word: str, limit: int | None = None) -> list[tuple[str, str]]:
+        """Статьи по порядку: (название словаря, текст без разметки)."""
+        entries = self.articles.get(word) or self.articles.get(word.capitalize()) or []
+        return [self._article(self._read(offset, size)) for offset, size in entries[:limit]]
+
+    @staticmethod
+    def _article(raw: str) -> tuple[str, str]:
+        source = re.search(r"<sup>(.*?)</sup>", raw)
+        raw = re.sub(r"<script.*?</script>|<link[^>]*>|<div class=\"k\">.*?</div>|<sup>.*?</sup>", "", raw, flags=re.S)
+        text = html.unescape(re.sub(r"<[^>]+>", "", re.sub(r"<br\s*/?>", "\n", raw)))
+        lines = (re.sub(r"\s+", " ", line).strip() for line in text.splitlines())
+        return (html.unescape(source.group(1)) if source else "", "\n".join(line for line in lines if line))
+
+
+try:
+    RU_DICT = RuDictionary(DICT_PATH)
+except OSError as e:
+    RU_DICT = None
+    logging.warning("толковый словарь не загружен: %s", e)
+
+
+def definition_quote(word: str) -> str:
+    """Первые статьи словаря свёрнутой цитатой; обрезаем, чтобы карточка влезла в сообщение."""
+    articles = RU_DICT.lookup(word, DICT_ARTICLES) if RU_DICT else []
+    if not articles:
+        return ""
+    text = "\n\n".join(f"{source}\n{body}" for source, body in articles)
+    budget = MESSAGE_LIMIT - 300 - len(word)  # 300 — запас на заголовок карточки и строку статуса
+    if len(text) > budget:
+        text = text[:budget].rstrip() + "…"
+    return (
+        f"\n<blockquote expandable>{html.escape(text)}\n\n"
+        f"<code>/dict {html.escape(word)}</code> — все толкования</blockquote>"
+    )
+
+
 def word_card(word: str, translations: list[str], examples: list[str], hidden: bool, corrected_from: str | None = None) -> str:
     source_flag, target_flag = flags(word)
-    shown = html.escape(", ".join(translations))
-    text = f"{source_flag} <b>{html.escape(word)}</b>\n{target_flag} " + (f"<tg-spoiler>{shown}</tg-spoiler>" if hidden else shown)
+    text = f"{source_flag} <b>{html.escape(word)}</b>"
+    if translations == [DICT_NOT_FOUND]:
+        text += f"\n📖 {DICT_NOT_FOUND}"
+    elif translations != [DICT_MARK]:
+        shown = html.escape(", ".join(translations))
+        text += f"\n{target_flag} " + (f"<tg-spoiler>{shown}</tg-spoiler>" if hidden else shown)
     if corrected_from:
         text += f"\n<i>исправлено: {html.escape(corrected_from)} → {html.escape(word)}</i>"
+    if translations == [DICT_MARK]:
+        return text + definition_quote(word)
     return text + examples_quote(examples)
 
 
@@ -306,7 +402,19 @@ async def translate_word(word: str) -> list[str]:
         translations = await _guarded("yandex", _from_yandex(word)) or await _guarded("gigachat", _from_gigachat(word))
 
     translations = list(dict.fromkeys(translations))
-    return translations[:5] or ["перевод_не_найден"]
+    return translations[:5] or [NOT_FOUND]
+
+
+@dp.message(Command("dict"))
+async def dict_command(message: Message, command: CommandObject):
+    word = (command.args or "").strip().lower()
+    articles = RU_DICT.lookup(word) if RU_DICT and word else []
+    if not articles:
+        await message.answer("Нет в словаре" if word else "Напиши слово после команды: <code>/dict гуталин</code>")
+        return
+    # markdown склеивает соседние строки, поэтому в конце каждой строки жёсткий перенос — два пробела
+    body = "\n\n".join(f"## {source}\n\n" + "  \n".join(text.splitlines()) for source, text in articles)
+    await message.answer_document(BufferedInputFile(f"# {word}\n\n{body}\n".encode(), filename=f"{word}_толкования.md"))
 
 
 @dp.message(F.text)
@@ -348,7 +456,7 @@ async def handle_word(chat: Message, user_id: int, text: str, autocorrect: bool)
             f"\n\nУже в словаре с {known_saved_at:%d.%m.%Y}. "
             f"Следующее повторение {known_next:%d.%m в %H:%M}, интервал {INTERVALS_STR[known_idx]}."
         )
-        markup = card_markup(known_id, corrected_from, new_word=False)
+        markup = card_markup(known_id, corrected_from, new_word=False, in_dict=russian_mode(word, known_translations))
         shown = pick_examples(known_examples)
         msg = await chat.answer(word_card(word, known_translations, shown, True, corrected_from) + status, reply_markup=markup)
         if not known_examples and (examples := await examples_task) and await store_examples(known_id, examples):
@@ -356,12 +464,16 @@ async def handle_word(chat: Message, user_id: int, text: str, autocorrect: bool)
             await msg.edit_text(word_card(word, known_translations, shown, True, corrected_from) + status, reply_markup=markup)
         return
 
-    translations = await translate_word(word)
-    found = translations != ["перевод_не_найден"]
+    if is_russian(word) and dict_mode.get(user_id):
+        translations = [DICT_MARK] if RU_DICT and RU_DICT.lookup(word, 1) else [DICT_NOT_FOUND]
+    else:
+        translations = await translate_word(word)
+    found = translations not in ([NOT_FOUND], [DICT_NOT_FOUND])
+    in_dict = russian_mode(word, translations)
 
     msg = await chat.answer(
         word_card(word, translations, [], False, corrected_from),
-        reply_markup=card_markup(0 if found else None, corrected_from, new_word=True)
+        reply_markup=card_markup(0 if found else None, corrected_from, new_word=True, in_dict=in_dict)
     )
 
     if not found:
@@ -380,7 +492,7 @@ async def handle_word(chat: Message, user_id: int, text: str, autocorrect: bool)
         session.add(new_word)
         await session.flush()
 
-        markup = card_markup(new_word.id, corrected_from, new_word=True)
+        markup = card_markup(new_word.id, corrected_from, new_word=True, in_dict=in_dict)
         await msg.edit_reply_markup(reply_markup=markup)
         await session.commit()
 
@@ -395,7 +507,14 @@ async def handle_word(chat: Message, user_id: int, text: str, autocorrect: bool)
         await msg.edit_text(word_card(word, translations, shown, True, corrected_from), reply_markup=markup)
 
 
-def card_markup(word_id: int | None, corrected_from: str | None, new_word: bool) -> InlineKeyboardMarkup | None:
+def russian_mode(word: str, translations: list[str]) -> bool | None:
+    """Для русских слов — показано ли толкование (иначе перевод); для английских None."""
+    return translations in ([DICT_MARK], [DICT_NOT_FOUND]) if is_russian(word) else None
+
+
+def card_markup(
+    word_id: int | None, corrected_from: str | None, new_word: bool, in_dict: bool | None = None
+) -> InlineKeyboardMarkup | None:
     rows = []
     if word_id is not None:
         rows.append([InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=word_id).pack())])
@@ -407,6 +526,11 @@ def card_markup(word_id: int | None, corrected_from: str | None, new_word: bool)
             rows.append([InlineKeyboardButton(text=f"Оставить {corrected_from}", callback_data=data)])
         except ValueError:
             pass  # длиннее 64 байт или с «:» — в кнопку не влезает
+    if in_dict is not None:
+        rows.append([InlineKeyboardButton(
+            text="Перевести" if in_dict else "Найти в словаре",
+            callback_data=SwitchMode(id=word_id or 0, to_dict=not in_dict).pack(),
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
@@ -433,7 +557,8 @@ async def del_word(query: CallbackQuery, callback_data: DelWord):
         if word:
             # из базы, а не из текста сообщения: там теперь примеры, и разметку текст не сохраняет
             source_flag, target_flag = flags(word.word_en)
-            card = html.escape(f"{source_flag} {word.word_en}\n{target_flag} {', '.join(word.translations_ru)}")
+            meaning = "📖 толкование" if word.translations_ru == [DICT_MARK] else f"{target_flag} {', '.join(word.translations_ru)}"
+            card = html.escape(f"{source_flag} {word.word_en}\n{meaning}")
             await session.delete(word)
             await session.commit()
             assert isinstance(query.message, Message)
@@ -458,6 +583,42 @@ async def keep_original(query: CallbackQuery, callback_data: KeepOriginal):
     except TelegramBadRequest:  # старше 48 часов — удалить уже нельзя, просто убираем кнопки
         await query.message.edit_reply_markup(reply_markup=None)
     await handle_word(query.message, query.from_user.id, callback_data.word, autocorrect=False)
+
+
+@dp.callback_query(SwitchMode.filter())
+async def switch_mode(query: CallbackQuery, callback_data: SwitchMode):
+    assert isinstance(query.message, Message) and query.message.text is not None
+    word = query.message.text.split("\n", 1)[0].split(" ", 1)[1]  # первая строка карточки — «🇷🇺 слово»
+    if callback_data.to_dict:
+        translations = [DICT_MARK] if RU_DICT and RU_DICT.lookup(word, 1) else None
+    else:
+        translations = await translate_word(word)
+        translations = None if translations == [NOT_FOUND] else translations
+    if translations is None:
+        await query.answer(DICT_NOT_FOUND.capitalize() if callback_data.to_dict else "Перевод не найден", show_alert=True)
+        return
+
+    dict_mode[query.from_user.id] = callback_data.to_dict
+    async with async_session() as session:
+        row = await session.get(Word, callback_data.id) if callback_data.id else None
+        if row is None:  # в прежнем режиме слово не нашлось и в словарь не попало — добавляем сейчас
+            row = Word(
+                user_id=query.from_user.id,
+                message_id=query.message.message_id,
+                word_en=word,
+                next_repeat_time=datetime.now() + INTERVALS[0],
+                interval_index=0,
+            )
+            session.add(row)
+        row.translations_ru = translations
+        await session.commit()
+        word_id = row.id
+
+    await query.answer()
+    await query.message.edit_text(
+        word_card(word, translations, [], hidden=False),
+        reply_markup=card_markup(word_id, None, new_word=True, in_dict=callback_data.to_dict),
+    )
 
 
 @dp.callback_query(ForgotWord.filter())
@@ -489,9 +650,12 @@ async def scheduler():
                 if not word.examples and not is_russian(word.word_en):
                     word.examples = await _guarded("tatoeba", _from_tatoeba(word.word_en), EXAMPLES_TIMEOUT) or None
                 examples = pick_examples(word.examples)
+                meaning = (
+                    definition_quote(word.word_en) if word.translations_ru == [DICT_MARK]
+                    else f"\n<tg-spoiler>{', '.join(word.translations_ru)}</tg-spoiler>{examples_quote(examples)}"
+                )
                 text = (
-                    f"<b>{word.word_en}</b>\n"
-                    f"<tg-spoiler>{', '.join(word.translations_ru)}</tg-spoiler>{examples_quote(examples)}\n\n"
+                    f"<b>{word.word_en}</b>{meaning}\n\n"
                     f"Повторение слова через {INTERVALS_STR[max(next_idx - 1, 0)]}. Следующее -- через {INTERVALS_STR[next_idx]}"
                 )
                 markup = InlineKeyboardMarkup(inline_keyboard=[[
