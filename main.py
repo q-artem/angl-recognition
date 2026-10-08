@@ -167,11 +167,11 @@ async def _from_gigachat(word: str) -> list[str]:
     return [t.strip(" .\"'«»").lower() for t in answer.split(",") if t.strip(" .\"'«»")]
 
 
-async def _from_yandex(word: str) -> list[str]:
+async def _from_yandex(word: str, lang: str = "en-ru") -> list[str]:
     url = "https://dictionary.yandex.net/api/v1/dicservice.json/lookup"
     params = {
         "key": YANDEX_DICT_KEY or "",
-        "lang": "en-ru",
+        "lang": lang,
         "text": word
     }
 
@@ -233,16 +233,28 @@ async def _guarded(name: str, coro, timeout: float = SOURCE_TIMEOUT) -> list[str
     return []
 
 
-def word_card(en_word: str, translations: list[str], examples: list[str], hidden: bool) -> str:
+def is_russian(word: str) -> bool:
+    return re.search(r"[а-яё]", word, re.IGNORECASE) is not None
+
+
+def flags(word: str) -> tuple[str, str]:
+    # русские слова лежат в тех же колонках word_en / translations_ru, просто направление перевода обратное
+    return ("🇷🇺", "🇬🇧") if is_russian(word) else ("🇬🇧", "🇷🇺")
+
+
+def word_card(word: str, translations: list[str], examples: list[str], hidden: bool) -> str:
+    source_flag, target_flag = flags(word)
     shown = html.escape(", ".join(translations))
-    text = f"🇬🇧 <b>{html.escape(en_word)}</b>\n🇷🇺 " + (f"<tg-spoiler>{shown}</tg-spoiler>" if hidden else shown)
+    text = f"{source_flag} <b>{html.escape(word)}</b>\n{target_flag} " + (f"<tg-spoiler>{shown}</tg-spoiler>" if hidden else shown)
     if examples:
         text += "\n<blockquote expandable>" + html.escape("\n".join(f"• {e}" for e in examples)) + "</blockquote>"
     return text
 
 
 async def translate_word(word: str) -> list[str]:
-    if " " in word:
+    if is_russian(word):
+        translations = await _guarded("yandex", _from_yandex(word, "ru-en"))
+    elif " " in word:
         # фразы и идиомы словарь почти не знает — основной перевод от GigaChat
         gigachat, yandex = await asyncio.gather(
             _guarded("gigachat", _from_gigachat(word)),
@@ -259,15 +271,19 @@ async def translate_word(word: str) -> list[str]:
 @dp.message(F.text)
 async def add_word(message: Message):
     assert message.text is not None and message.from_user is not None
-    en_word = message.text.strip().lower()
-    # примеры ищутся несколько секунд — перевод отправляем сразу, а их дописываем, когда придут
-    examples_task = asyncio.create_task(_guarded("tatoeba", _from_tatoeba(en_word), EXAMPLES_TIMEOUT))
+    word = message.text.strip().lower()
+    # примеры ищутся несколько секунд — перевод отправляем сразу, а их дописываем, когда придут;
+    # для русских слов примеров нет
+    examples_task = asyncio.create_task(
+        asyncio.sleep(0, result=[]) if is_russian(word)
+        else _guarded("tatoeba", _from_tatoeba(word), EXAMPLES_TIMEOUT)
+    )
 
     async with async_session() as session:
         known = (await session.execute(
             select(Word).where(
                 Word.user_id == message.from_user.id,
-                Word.word_en == en_word
+                Word.word_en == word
             )
         )).scalars().first()
         if known is not None:
@@ -285,15 +301,15 @@ async def add_word(message: Message):
         markup = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=known_id).pack())
         ]])
-        msg = await message.answer(word_card(en_word, known_translations, [], hidden=True) + status, reply_markup=markup)
+        msg = await message.answer(word_card(word, known_translations, [], hidden=True) + status, reply_markup=markup)
         if (examples := await examples_task) and await word_exists(known_id):
-            await msg.edit_text(word_card(en_word, known_translations, examples, hidden=True) + status, reply_markup=markup)
+            await msg.edit_text(word_card(word, known_translations, examples, hidden=True) + status, reply_markup=markup)
         return
 
-    translations = await translate_word(en_word)
+    translations = await translate_word(word)
 
     msg = await message.answer(
-        word_card(en_word, translations, [], hidden=False),
+        word_card(word, translations, [], hidden=False),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=0).pack())
         ]]) if translations != ["перевод_не_найден"] else None
@@ -308,7 +324,7 @@ async def add_word(message: Message):
         new_word = Word(
             user_id=message.from_user.id,
             message_id=msg.message_id,
-            word_en=en_word,
+            word_en=word,
             translations_ru=translations,
             next_repeat_time=datetime.now() + INTERVALS[0],
             interval_index=0
@@ -324,11 +340,11 @@ async def add_word(message: Message):
 
     # пока искались примеры, слово могли успеть удалить — тогда сообщение не трогаем
     if (examples := await examples_task) and await word_exists(new_word.id):
-        await msg.edit_text(word_card(en_word, translations, examples, hidden=False), reply_markup=markup)
+        await msg.edit_text(word_card(word, translations, examples, hidden=False), reply_markup=markup)
 
     await asyncio.sleep(30)
     if await word_exists(new_word.id):
-        await msg.edit_text(word_card(en_word, translations, examples, hidden=True), reply_markup=markup)
+        await msg.edit_text(word_card(word, translations, examples, hidden=True), reply_markup=markup)
 
 
 async def word_exists(word_id: int) -> bool:
@@ -342,7 +358,8 @@ async def del_word(query: CallbackQuery, callback_data: DelWord):
         word = await session.get(Word, callback_data.id)
         if word:
             # из базы, а не из текста сообщения: там теперь примеры, и разметку текст не сохраняет
-            card = html.escape(f"🇬🇧 {word.word_en}\n🇷🇺 {', '.join(word.translations_ru)}")
+            source_flag, target_flag = flags(word.word_en)
+            card = html.escape(f"{source_flag} {word.word_en}\n{target_flag} {', '.join(word.translations_ru)}")
             await session.delete(word)
             await session.commit()
             assert isinstance(query.message, Message)
