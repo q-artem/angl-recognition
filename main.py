@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InaccessibleMessage, ReplyParameters, BufferedInputFile
 from aiogram.filters.callback_data import CallbackData
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import Column, Integer, String, DateTime, JSON, BigInteger, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import declarative_base, Mapped, mapped_column
@@ -59,6 +60,11 @@ class DelWord(CallbackData, prefix="del"):
 
 class ForgotWord(CallbackData, prefix="fgt"):
     id: int
+
+
+class KeepOriginal(CallbackData, prefix="keep"):
+    id: int  # исправленное слово, добавленное в словарь этой карточкой; 0 — удалять нечего
+    word: str
 
 
 session = AiohttpSession(proxy=PROXY_URL)
@@ -250,11 +256,34 @@ def flags(word: str) -> tuple[str, str]:
     return ("🇷🇺", "🇬🇧") if is_russian(word) else ("🇬🇧", "🇷🇺")
 
 
-def word_card(word: str, translations: list[str], examples: list[str], hidden: bool) -> str:
+def word_card(word: str, translations: list[str], examples: list[str], hidden: bool, corrected_from: str | None = None) -> str:
     source_flag, target_flag = flags(word)
     shown = html.escape(", ".join(translations))
     text = f"{source_flag} <b>{html.escape(word)}</b>\n{target_flag} " + (f"<tg-spoiler>{shown}</tg-spoiler>" if hidden else shown)
+    if corrected_from:
+        text += f"\n<i>исправлено: {html.escape(corrected_from)} → {html.escape(word)}</i>"
     return text + examples_quote(examples)
+
+
+async def correct_spelling(text: str) -> str:
+    try:
+        timeout = aiohttp.ClientTimeout(total=SOURCE_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as http_session:
+            async with http_session.get(
+                "https://speller.yandex.net/services/spellservice.json/checkText",
+                params={"text": text, "lang": "ru" if is_russian(text) else "en"},
+            ) as response:
+                response.raise_for_status()
+                errors = await response.json()
+    except Exception as e:
+        logging.warning("speller: ошибка — %s", e)
+        return text
+
+    # правим с конца, чтобы позиции ещё не исправленных слов не съезжали
+    for error in sorted(errors, key=lambda e: e["pos"], reverse=True):
+        if error["s"]:
+            text = text[:error["pos"]] + error["s"][0] + text[error["pos"] + error["len"]:]
+    return text
 
 
 def examples_quote(examples: list[str]) -> str:
@@ -283,12 +312,19 @@ async def translate_word(word: str) -> list[str]:
 @dp.message(F.text)
 async def add_word(message: Message):
     assert message.text is not None and message.from_user is not None
-    word = message.text.strip().lower()
+    await handle_word(message, message.from_user.id, message.text, autocorrect=True)
+
+
+async def handle_word(chat: Message, user_id: int, text: str, autocorrect: bool):
+    """Переводит слово и добавляет в словарь; chat — любое сообщение из нужного чата, ответ уходит туда."""
+    original = text.strip().lower()
+    word = (await correct_spelling(original)).lower() if autocorrect else original
+    corrected_from = original if word != original else None
 
     async with async_session() as session:
         known = (await session.execute(
             select(Word).where(
-                Word.user_id == message.from_user.id,
+                Word.user_id == user_id,
                 Word.word_en == word
             )
         )).scalars().first()
@@ -312,33 +348,29 @@ async def add_word(message: Message):
             f"\n\nУже в словаре с {known_saved_at:%d.%m.%Y}. "
             f"Следующее повторение {known_next:%d.%m в %H:%M}, интервал {INTERVALS_STR[known_idx]}."
         )
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=known_id).pack())
-        ]])
+        markup = card_markup(known_id, corrected_from, new_word=False)
         shown = pick_examples(known_examples)
-        msg = await message.answer(word_card(word, known_translations, shown, hidden=True) + status, reply_markup=markup)
+        msg = await chat.answer(word_card(word, known_translations, shown, True, corrected_from) + status, reply_markup=markup)
         if not known_examples and (examples := await examples_task) and await store_examples(known_id, examples):
             shown = pick_examples(examples)
-            await msg.edit_text(word_card(word, known_translations, shown, hidden=True) + status, reply_markup=markup)
+            await msg.edit_text(word_card(word, known_translations, shown, True, corrected_from) + status, reply_markup=markup)
         return
 
     translations = await translate_word(word)
+    found = translations != ["перевод_не_найден"]
 
-    msg = await message.answer(
-        word_card(word, translations, [], hidden=False),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=0).pack())
-        ]]) if translations != ["перевод_не_найден"] else None
+    msg = await chat.answer(
+        word_card(word, translations, [], False, corrected_from),
+        reply_markup=card_markup(0 if found else None, corrected_from, new_word=True)
     )
 
-    if translations == ["перевод_не_найден"]:
+    if not found:
         examples_task.cancel()
         return
 
     async with async_session() as session:
-        assert message.from_user is not None
         new_word = Word(
-            user_id=message.from_user.id,
+            user_id=user_id,
             message_id=msg.message_id,
             word_en=word,
             translations_ru=translations,
@@ -348,9 +380,7 @@ async def add_word(message: Message):
         session.add(new_word)
         await session.flush()
 
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=new_word.id).pack())
-        ]])
+        markup = card_markup(new_word.id, corrected_from, new_word=True)
         await msg.edit_reply_markup(reply_markup=markup)
         await session.commit()
 
@@ -358,11 +388,26 @@ async def add_word(message: Message):
     shown = []
     if (examples := await examples_task) and await store_examples(new_word.id, examples):
         shown = pick_examples(examples)
-        await msg.edit_text(word_card(word, translations, shown, hidden=False), reply_markup=markup)
+        await msg.edit_text(word_card(word, translations, shown, False, corrected_from), reply_markup=markup)
 
     await asyncio.sleep(30)
     if await word_exists(new_word.id):
-        await msg.edit_text(word_card(word, translations, shown, hidden=True), reply_markup=markup)
+        await msg.edit_text(word_card(word, translations, shown, True, corrected_from), reply_markup=markup)
+
+
+def card_markup(word_id: int | None, corrected_from: str | None, new_word: bool) -> InlineKeyboardMarkup | None:
+    rows = []
+    if word_id is not None:
+        rows.append([InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=word_id).pack())])
+    if corrected_from:
+        try:
+            # исходное слово храним в самой кнопке, чтобы она работала и после перезапуска бота;
+            # уже известное слово отмена удалять не должна, поэтому для него id = 0
+            data = KeepOriginal(id=word_id if new_word and word_id else 0, word=corrected_from).pack()
+            rows.append([InlineKeyboardButton(text=f"Оставить {corrected_from}", callback_data=data)])
+        except ValueError:
+            pass  # длиннее 64 байт или с «:» — в кнопку не влезает
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 async def word_exists(word_id: int) -> bool:
@@ -395,6 +440,24 @@ async def del_word(query: CallbackQuery, callback_data: DelWord):
             await query.message.edit_text(f"<s>{card}</s>\nУдалено из базы.")
         else:
             await query.answer("Слово не найдено в базе.")
+
+
+@dp.callback_query(KeepOriginal.filter())
+async def keep_original(query: CallbackQuery, callback_data: KeepOriginal):
+    assert isinstance(query.message, Message)
+    if callback_data.id:
+        # исправленное слово попало в словарь только из-за этой карточки — убираем его
+        async with async_session() as session:
+            word = await session.get(Word, callback_data.id)
+            if word:
+                await session.delete(word)
+                await session.commit()
+    await query.answer()
+    try:
+        await query.message.delete()
+    except TelegramBadRequest:  # старше 48 часов — удалить уже нельзя, просто убираем кнопки
+        await query.message.edit_reply_markup(reply_markup=None)
+    await handle_word(query.message, query.from_user.id, callback_data.word, autocorrect=False)
 
 
 @dp.callback_query(ForgotWord.filter())
