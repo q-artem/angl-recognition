@@ -503,7 +503,11 @@ async def handle_word(chat: Message, user_id: int, text: str, autocorrect: bool)
         await msg.edit_text(word_card(word, translations, shown, False, corrected_from), reply_markup=markup)
 
     await asyncio.sleep(30)
-    if await word_exists(new_word.id):
+    # слово могли удалить или переключить в другой режим — тогда карточку уже перерисовали, не трогаем
+    async with async_session() as session:
+        row = await session.get(Word, new_word.id)
+        unchanged = row is not None and row.translations_ru == translations
+    if unchanged:
         await msg.edit_text(word_card(word, translations, shown, True, corrected_from), reply_markup=markup)
 
 
@@ -532,11 +536,6 @@ def card_markup(
             callback_data=SwitchMode(id=word_id or 0, to_dict=not in_dict).pack(),
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-
-
-async def word_exists(word_id: int) -> bool:
-    async with async_session() as session:
-        return await session.get(Word, word_id) is not None
 
 
 async def store_examples(word_id: int, examples: list[str]) -> bool:
