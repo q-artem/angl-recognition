@@ -246,9 +246,13 @@ def word_card(word: str, translations: list[str], examples: list[str], hidden: b
     source_flag, target_flag = flags(word)
     shown = html.escape(", ".join(translations))
     text = f"{source_flag} <b>{html.escape(word)}</b>\n{target_flag} " + (f"<tg-spoiler>{shown}</tg-spoiler>" if hidden else shown)
-    if examples:
-        text += "\n<blockquote expandable>" + html.escape("\n".join(f"• {e}" for e in examples)) + "</blockquote>"
-    return text
+    return text + examples_quote(examples)
+
+
+def examples_quote(examples: list[str]) -> str:
+    if not examples:
+        return ""
+    return "\n<blockquote expandable>" + html.escape("\n".join(f"• {e}" for e in examples)) + "</blockquote>"
 
 
 async def translate_word(word: str) -> list[str]:
@@ -393,9 +397,13 @@ async def scheduler():
             for word in words:
                 next_idx = min(word.interval_index + 1, len(INTERVALS) - 1)
 
+                # примеры каждый раз новые: Tatoeba отдаёт их в случайном порядке
+                examples = [] if is_russian(word.word_en) else await _guarded(
+                    "tatoeba", _from_tatoeba(word.word_en), EXAMPLES_TIMEOUT
+                )
                 text = (
                     f"<b>{word.word_en}</b>\n"
-                    f"<tg-spoiler>{', '.join(word.translations_ru)}</tg-spoiler>\n\n"
+                    f"<tg-spoiler>{', '.join(word.translations_ru)}</tg-spoiler>{examples_quote(examples)}\n\n"
                     f"Повторение слова через {INTERVALS_STR[max(next_idx - 1, 0)]}. Следующее -- через {INTERVALS_STR[next_idx]}"
                 )
                 markup = InlineKeyboardMarkup(inline_keyboard=[[
