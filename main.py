@@ -3,6 +3,7 @@ import asyncio
 import html
 import logging
 import os
+import random
 import re
 import ssl
 import time
@@ -46,6 +47,7 @@ class Word(Base):
     message_id: Mapped[int] = mapped_column(BigInteger)
     word_en: Mapped[str]
     translations_ru: Mapped[list] = mapped_column(JSON)
+    examples: Mapped[list | None] = mapped_column(JSON, nullable=True)  # до EXAMPLES_STORED предложений из Tatoeba
     saved_at: Mapped[datetime] = mapped_column(default=datetime.now)
     next_repeat_time: Mapped[datetime]
     interval_index: Mapped[int] = mapped_column(default=0)
@@ -190,7 +192,8 @@ async def _from_yandex(word: str, lang: str = "en-ru") -> list[str]:
     return found
 
 
-EXAMPLES_COUNT = 5
+EXAMPLES_COUNT = 5  # показываем случайные из сохранённых, чтобы в повторениях они менялись
+EXAMPLES_STORED = 10
 EXAMPLES_TIMEOUT = 12  # Tatoeba отвечает за 1–2 с, запросов бывает два, а параллельно сервер их не ускоряет
 
 
@@ -215,9 +218,14 @@ async def _from_tatoeba(word: str) -> list[str]:
                 response.raise_for_status()
                 found = [sentence["text"] for sentence in (await response.json())["data"]]
             sentences = list(dict.fromkeys(sentences + [s for s in found if pattern is None or pattern.search(s)]))
-            if len(sentences) >= EXAMPLES_COUNT:
+            if len(sentences) >= EXAMPLES_STORED:
                 break
-    return sentences[:EXAMPLES_COUNT]
+    return sentences[:EXAMPLES_STORED]
+
+
+def pick_examples(examples: list[str] | None) -> list[str]:
+    examples = examples or []
+    return random.sample(examples, min(EXAMPLES_COUNT, len(examples)))
 
 
 async def _guarded(name: str, coro, timeout: float = SOURCE_TIMEOUT) -> list[str]:
@@ -276,12 +284,6 @@ async def translate_word(word: str) -> list[str]:
 async def add_word(message: Message):
     assert message.text is not None and message.from_user is not None
     word = message.text.strip().lower()
-    # примеры ищутся несколько секунд — перевод отправляем сразу, а их дописываем, когда придут;
-    # для русских слов примеров нет
-    examples_task = asyncio.create_task(
-        asyncio.sleep(0, result=[]) if is_russian(word)
-        else _guarded("tatoeba", _from_tatoeba(word), EXAMPLES_TIMEOUT)
-    )
 
     async with async_session() as session:
         known = (await session.execute(
@@ -296,6 +298,14 @@ async def add_word(message: Message):
             known_saved_at = known.saved_at
             known_next = known.next_repeat_time
             known_idx = known.interval_index
+            known_examples = known.examples
+
+    # примеры ищутся несколько секунд — перевод отправляем сразу, а их дописываем, когда придут;
+    # для русских слов примеров нет, у известного слова они могут быть уже сохранены
+    examples_task = asyncio.create_task(
+        asyncio.sleep(0, result=[]) if is_russian(word) or (known is not None and known_examples)
+        else _guarded("tatoeba", _from_tatoeba(word), EXAMPLES_TIMEOUT)
+    )
 
     if known is not None:
         status = (
@@ -305,9 +315,11 @@ async def add_word(message: Message):
         markup = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Удалить из базы", callback_data=DelWord(id=known_id).pack())
         ]])
-        msg = await message.answer(word_card(word, known_translations, [], hidden=True) + status, reply_markup=markup)
-        if (examples := await examples_task) and await word_exists(known_id):
-            await msg.edit_text(word_card(word, known_translations, examples, hidden=True) + status, reply_markup=markup)
+        shown = pick_examples(known_examples)
+        msg = await message.answer(word_card(word, known_translations, shown, hidden=True) + status, reply_markup=markup)
+        if not known_examples and (examples := await examples_task) and await store_examples(known_id, examples):
+            shown = pick_examples(examples)
+            await msg.edit_text(word_card(word, known_translations, shown, hidden=True) + status, reply_markup=markup)
         return
 
     translations = await translate_word(word)
@@ -343,17 +355,30 @@ async def add_word(message: Message):
         await session.commit()
 
     # пока искались примеры, слово могли успеть удалить — тогда сообщение не трогаем
-    if (examples := await examples_task) and await word_exists(new_word.id):
-        await msg.edit_text(word_card(word, translations, examples, hidden=False), reply_markup=markup)
+    shown = []
+    if (examples := await examples_task) and await store_examples(new_word.id, examples):
+        shown = pick_examples(examples)
+        await msg.edit_text(word_card(word, translations, shown, hidden=False), reply_markup=markup)
 
     await asyncio.sleep(30)
     if await word_exists(new_word.id):
-        await msg.edit_text(word_card(word, translations, examples, hidden=True), reply_markup=markup)
+        await msg.edit_text(word_card(word, translations, shown, hidden=True), reply_markup=markup)
 
 
 async def word_exists(word_id: int) -> bool:
     async with async_session() as session:
         return await session.get(Word, word_id) is not None
+
+
+async def store_examples(word_id: int, examples: list[str]) -> bool:
+    """Сохраняет примеры слова; False, если слово уже удалили."""
+    async with async_session() as session:
+        word = await session.get(Word, word_id)
+        if word is None:
+            return False
+        word.examples = examples
+        await session.commit()
+        return True
 
 
 @dp.callback_query(DelWord.filter())
@@ -397,10 +422,10 @@ async def scheduler():
             for word in words:
                 next_idx = min(word.interval_index + 1, len(INTERVALS) - 1)
 
-                # примеры каждый раз новые: Tatoeba отдаёт их в случайном порядке
-                examples = [] if is_russian(word.word_en) else await _guarded(
-                    "tatoeba", _from_tatoeba(word.word_en), EXAMPLES_TIMEOUT
-                )
+                # у старых слов примеров ещё нет — ищем один раз и сохраняем
+                if not word.examples and not is_russian(word.word_en):
+                    word.examples = await _guarded("tatoeba", _from_tatoeba(word.word_en), EXAMPLES_TIMEOUT) or None
+                examples = pick_examples(word.examples)
                 text = (
                     f"<b>{word.word_en}</b>\n"
                     f"<tg-spoiler>{', '.join(word.translations_ru)}</tg-spoiler>{examples_quote(examples)}\n\n"
