@@ -556,12 +556,17 @@ async def del_word(query: CallbackQuery, callback_data: DelWord):
         if word:
             # из базы, а не из текста сообщения: там теперь примеры, и разметку текст не сохраняет
             source_flag, target_flag = flags(word.word_en)
-            meaning = "📖 толкование" if word.translations_ru == [DICT_MARK] else f"{target_flag} {', '.join(word.translations_ru)}"
-            card = html.escape(f"{source_flag} {word.word_en}\n{meaning}")
+            header = html.escape(f"{source_flag} {word.word_en}")
+            if word.translations_ru == [DICT_MARK]:
+                # толкование оставляем: зачёркивание на цитату не ложится, поэтому зачёркнуто только слово
+                card = f"<s>{header}</s>{definition_quote(word.word_en)}"
+            else:
+                meaning = html.escape(f"{target_flag} {', '.join(word.translations_ru)}")
+                card = f"<s>{header}\n{meaning}</s>"
             await session.delete(word)
             await session.commit()
             assert isinstance(query.message, Message)
-            await query.message.edit_text(f"<s>{card}</s>\nУдалено из базы.")
+            await query.message.edit_text(f"{card}\nУдалено из базы.")
         else:
             await query.answer("Слово не найдено в базе.")
 
